@@ -37,4 +37,8 @@ On the target router:
    cd netis-wisp-autoconfig
 
 
+
+
+
 **THE TUTORIAL IS IN THIS VIDEO**
+[![Watch the video](https://youtube.com)](https://youtu.be/z5xL6qee1HY)
