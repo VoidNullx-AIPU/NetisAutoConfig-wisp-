@@ -1,159 +1,178 @@
 #!/usr/bin/env bash
+# =============================================================================
+#  Netis / Realtek Router — 1-Run Setup & Persistent Systemd Watchdog
+# =============================================================================
 
 set -e
 
-echo "=================================================="
-echo "    Netis / Realtek Router WISP Setup             "
-echo "=================================================="
-echo ""
+for cmd in sshpass ssh ping; do
+    command -v "$cmd" &>/dev/null || { echo "Missing dependency: $cmd"; exit 1; }
+done
 
-# 1. Interactive prompts
-read -rp "[?] Enter Router IP: " ROUTER_IP
-read -rsp "[?] Enter Router SSH Password: " ROUTER_PASS
-echo ""
-read -rp "[?] Enter Target Main Router SSID: " TARGET_SSID
-read -rsp "[?] Enter Target Main Router Password: " TARGET_PASS
-echo ""
-echo ""
+echo "=== Netis/Realtek WISP Setup (Automated PC Managed) ==="
+read -rp  "Router IP            : " ROUTER_IP
+read -rsp "Router SSH password : " ROUTER_PASS; echo
+read -rp  "Upstream WiFi SSID  : " TARGET_SSID
+read -rsp "Upstream WiFi pass  : " TARGET_PASS; echo
+read -rp  "Enable persistent watchdog across reboots? [Y/n] (Default: Y): " WATCHDOG_ENABLE; echo
+WATCHDOG_ENABLE="${WATCHDOG_ENABLE:-Y}"
 
-# Legacy SSH parameters required for Realtek Dropbear daemon
-SSH_OPTS="-o KexAlgorithms=+diffie-hellman-group1-sha1 -o HostKeyAlgorithms=+ssh-rsa -o Ciphers=+aes128-cbc,3des-cbc -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "--------------------------------------------------"
-echo "[DEBUG 1/5] Testing reachability to $ROUTER_IP..."
-if ping -c 1 -W 2 "$ROUTER_IP" >/dev/null 2>&1; then
-    echo "[+] SUCCESS: Router at $ROUTER_IP is reachable."
+SSH_OPTS="-o KexAlgorithms=+diffie-hellman-group1-sha1 \
+          -o HostKeyAlgorithms=+ssh-rsa \
+          -o Ciphers=+aes128-cbc,3des-cbc \
+          -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null \
+          -o LogLevel=ERROR \
+          -o ConnectTimeout=5"
+
+rssh() { sshpass -p "$ROUTER_PASS" ssh $SSH_OPTS "root@$ROUTER_IP" "$@"; }
+
+# 1. Reachability Check
+echo "[1/4] Checking router connectivity..."
+ping -c 1 -W 1 "$ROUTER_IP" &>/dev/null || { echo "Cannot reach $ROUTER_IP"; exit 1; }
+
+# 2. Scanning
+echo "[2/4] Scanning for '$TARGET_SSID'..."
+SCAN=$(rssh "
+    iwpriv wlan0 set_mib opmode=0x10 2>/dev/null
+    ifconfig wlan0 down; ifconfig wlan0 up
+    sleep 2
+    iwpriv wlan0 at_ss '$TARGET_SSID' 2>/dev/null
+    sleep 4
+    cat /proc/wlan0/SS_Result 2>/dev/null
+")
+
+BSSID=$(echo "$SCAN" | awk -v ssid="$TARGET_SSID" '
+    /HwAddr:/  { mac=$2 }
+    /SSID:/    { s=$2 }
+    /RSSI:/    { if(s==ssid) print $2, mac }
+' | sort -rn | head -1 | awk '{print $2}' | tr -d ' \r\n' | tr '[:upper:]' '[:lower:]')
+
+CHANNEL=$(echo "$SCAN" | awk -v ssid="$TARGET_SSID" '
+    /Channel:/ { ch=$2 }
+    /SSID:/    { if($2==ssid) print ch }
+' | head -1 | tr -d ' \r\n')
+
+if [ -n "$BSSID" ]; then
+    echo "      Found BSSID: $BSSID | Channel: $CHANNEL"
 else
-    echo "[!] ERROR: Cannot ping $ROUTER_IP. Check physical link."
-    exit 1
+    echo "      Auto-detect failed."
+    read -rp "  Enter BSSID manually: " RAW
+    BSSID=$(echo "$RAW" | tr -d ':-' | tr '[:upper:]' '[:lower:]')
+    read -rp "  Enter Channel: " CHANNEL
 fi
 
-echo ""
-echo "[DEBUG 2/5] Configuring wlan0, bouncing interface, and triggering site survey..."
-sshpass -p "$ROUTER_PASS" ssh $SSH_OPTS "root@$ROUTER_IP" << EOF
-  iwpriv wlan0 set_mib opmode=0x08 2>/dev/null
-  iwpriv wlan0 set_mib ssid="$TARGET_SSID"
-  iwpriv wlan0 set_mib passphrase="$TARGET_PASS"
-  ifconfig wlan0 down
-  sleep 2
-  ifconfig wlan0 up
-  sleep 4
-  iwpriv wlan0 at_ss 2>/dev/null
-  sleep 3
-EOF
+# 3. Apply Connection & Route (Netis Compatible)
+echo "[3/4] Linking wlan0 and obtaining WAN lease..."
+rssh "
+    iwpriv wlan0 set_mib opmode=0x08
+    iwpriv wlan0 set_mib channel=$CHANNEL
+    iwpriv wlan0 set_mib ssid='$TARGET_SSID'
+    iwpriv wlan0 set_mib passphrase='$TARGET_PASS'
+    ifconfig wlan0 down; ifconfig wlan0 up
+    sleep 2
+    iwpriv wlan0 at_join $BSSID
+    sleep 3
 
-echo ""
-echo "[DEBUG 3/5] Reading /proc/wlan0/SS_Result from router..."
-SCAN_OUTPUT=$(timeout 6 sshpass -p "$ROUTER_PASS" ssh $SSH_OPTS "root@$ROUTER_IP" "cat /proc/wlan0/SS_Result 2>/dev/null" || true)
+    brctl delif br0 wlan0 2>/dev/null || true
+    killall -9 udhcpc 2>/dev/null || true
+    udhcpc -i wlan0 >/dev/null 2>&1 &
+    sleep 10
 
-if [ -n "$SCAN_OUTPUT" ]; then
-    echo "[+] Scan output received:"
-    echo "--------------------------------------------------"
-    echo "$SCAN_OUTPUT"
-    echo "--------------------------------------------------"
-else
-    echo "[!] WARNING: /proc/wlan0/SS_Result was empty!"
-fi
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo 1 > /proc/fast_nat 2>/dev/null || true
+    iptables -t nat -F
+    iptables -P FORWARD ACCEPT
+    iptables -F FORWARD
+    iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
+"
 
-echo ""
-echo "[DEBUG 4/5] Extracting HwAddr for SSID '$TARGET_SSID'..."
-BSSID=$(echo "$SCAN_OUTPUT" | awk -v target="$TARGET_SSID" '
-  /HwAddr:/ { mac=$2 }
-  /SSID:/ && $2 == target { print mac }
-' | tr -d ' \r\n' | tr '[:upper:]' '[:lower:]')
+# 4. Generate local helper scripts & persistent systemd unit
+echo "[4/4] Generating local scripts & setting up autostart..."
 
-if [ -z "$BSSID" ]; then
-    echo "[!] WARNING: Could not find HwAddr for '$TARGET_SSID' in scan results."
-    read -rp "[?] Enter BSSID manually (e.g. baafcacbe92a): " MANUAL_BSSID
-    BSSID=$(echo "$MANUAL_BSSID" | tr -d ':-' | tr '[:upper:]' '[:lower:]')
-else
-    echo "[+] SUCCESS: Captured Target BSSID: $BSSID"
-fi
-
-echo ""
-echo "[DEBUG 5/5] Executing at_join, unbridging wlan0, requesting DHCP, and applying NAT..."
-echo "--------------------------------------------------"
-
-sshpass -p "$ROUTER_PASS" ssh $SSH_OPTS "root@$ROUTER_IP" << EOF
-  echo "--> Joining BSSID $BSSID..."
-  iwpriv wlan0 at_join $BSSID
-  brctl delif br0 wlan0 2>/dev/null || true
-  sleep 4
-
-  echo "--> Requesting DHCP lease..."
-  udhcpc -i wlan0 >/dev/null 2>&1 &
-  sleep 10
-
-  echo "--> Configuring IP forwarding, NAT, and DNS redirect..."
-  echo 1 > /proc/sys/net/ipv4/ip_forward
-  echo 0 > /proc/fast_nat 2>/dev/null || true
-  iptables -t nat -F
-  iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
-  iptables -P FORWARD ACCEPT
-  iptables -F FORWARD
-  iptables -t nat -A PREROUTING -i br0 -p udp --dport 53 -j DNAT --to-destination 1.1.1.1
-  iptables -t nat -A PREROUTING -i br0 -p tcp --dport 53 -j DNAT --to-destination 1.1.1.1
-
-  echo "--> Router configuration complete!"
-EOF
-
-echo "--------------------------------------------------"
-echo "[+] Generating automated non-interactive script: quick_reconnect.sh..."
-
-cat << EOF > quick_reconnect.sh
+cat > "$SCRIPT_DIR/reconnect.sh" << EOF
 #!/usr/bin/env bash
+ROUTER_IP='$ROUTER_IP'
+ROUTER_PASS='$ROUTER_PASS'
+SSH_OPTS='$SSH_OPTS'
 
-# Hardcoded configuration generated automatically by setup_router.sh
-ROUTER_IP="$ROUTER_IP"
-ROUTER_PASS="$ROUTER_PASS"
-TARGET_SSID="$TARGET_SSID"
-TARGET_PASS="$TARGET_PASS"
-BSSID="$BSSID"
-
-SSH_OPTS="-o KexAlgorithms=+diffie-hellman-group1-sha1 -o HostKeyAlgorithms=+ssh-rsa -o Ciphers=+aes128-cbc,3des-cbc -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5"
-
-echo "[+] Re-applying WISP configuration to \$ROUTER_IP..."
-
-sshpass -p "\$ROUTER_PASS" ssh \$SSH_OPTS "root@\$ROUTER_IP" << REMOTE_EOF
-  echo "--> Setting station mode & credentials..."
-  iwpriv wlan0 set_mib opmode=0x08
-  iwpriv wlan0 set_mib ssid="$TARGET_SSID"
-  iwpriv wlan0 set_mib passphrase="$TARGET_PASS"
-
-  echo "--> Bouncing wlan0..."
-  ifconfig wlan0 down
-  sleep 2
-  ifconfig wlan0 up
-  sleep 4
-
-  echo "--> Joining BSSID $BSSID..."
-  iwpriv wlan0 at_join $BSSID
-  brctl delif br0 wlan0 2>/dev/null || true
-  sleep 4
-
-  echo "--> Requesting DHCP lease..."
-  udhcpc -i wlan0 >/dev/null 2>&1 &
-  sleep 10
-
-  echo "--> Configuring IP forwarding, NAT, and DNS redirect..."
-  echo 1 > /proc/sys/net/ipv4/ip_forward
-  echo 0 > /proc/fast_nat 2>/dev/null || true
-  iptables -t nat -F
-  iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
-  iptables -P FORWARD ACCEPT
-  iptables -F FORWARD
-  iptables -t nat -A PREROUTING -i br0 -p udp --dport 53 -j DNAT --to-destination 1.1.1.1
-  iptables -t nat -A PREROUTING -i br0 -p tcp --dport 53 -j DNAT --to-destination 1.1.1.1
-
-  echo "--> Quick reconnect finished successfully!"
-REMOTE_EOF
+sshpass -p "\$ROUTER_PASS" ssh \$SSH_OPTS "root@\$ROUTER_IP" "
+    iwpriv wlan0 set_mib opmode=0x08
+    iwpriv wlan0 set_mib channel=$CHANNEL
+    iwpriv wlan0 set_mib ssid='$TARGET_SSID'
+    iwpriv wlan0 set_mib passphrase='$TARGET_PASS'
+    ifconfig wlan0 down; ifconfig wlan0 up
+    sleep 2
+    iwpriv wlan0 at_join $BSSID
+    sleep 3
+    brctl delif br0 wlan0 2>/dev/null || true
+    killall -9 udhcpc 2>/dev/null || true
+    udhcpc -i wlan0 >/dev/null 2>&1 &
+    sleep 10
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo 1 > /proc/fast_nat 2>/dev/null || true
+    iptables -t nat -F
+    iptables -P FORWARD ACCEPT
+    iptables -F FORWARD
+    iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
+"
 EOF
+chmod +x "$SCRIPT_DIR/reconnect.sh"
 
-chmod +x quick_reconnect.sh
+cat > "$SCRIPT_DIR/pc_watchdog.sh" << 'WEOF'
+#!/usr/bin/env bash
+TARGET_PING="1.1.1.1"
+CHECK_INTERVAL=10
 
-echo ""
-echo "=================================================="
-echo " Setup complete!                                  "
-echo " Saved instant reconnect runner to: ./quick_reconnect.sh"
-echo " Run './quick_reconnect.sh' whenever the router restarts."
-echo "=================================================="
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+while true; do
+    if ! ping -c 1 -W 2 "$TARGET_PING" &>/dev/null; then
+        echo "[!] Connection lost at $(date '+%H:%M:%S'). Triggering PC reconnect..." >> "$SCRIPT_DIR/watchdog.log"
+        "$SCRIPT_DIR/reconnect.sh" >> "$SCRIPT_DIR/watchdog.log" 2>&1
+        sleep 15
+    fi
+    sleep "$CHECK_INTERVAL"
+done
+WEOF
+chmod +x "$SCRIPT_DIR/pc_watchdog.sh"
+
+# Cleanup existing instance before starting new service
+systemctl --user stop wisp-watchdog.service 2>/dev/null || true
+pkill -f "pc_watchdog.sh" 2>/dev/null || true
+
+case "$WATCHDOG_ENABLE" in
+    [Yy]*)
+        if command -v systemctl &>/dev/null; then
+            mkdir -p ~/.config/systemd/user
+            cat > ~/.config/systemd/user/wisp-watchdog.service << EOF
+[Unit]
+Description=PC WISP Router Watchdog
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$SCRIPT_DIR/pc_watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+            systemctl --user daemon-reload
+            systemctl --user enable --now wisp-watchdog.service >/dev/null 2>&1
+            echo ""
+            echo "=== Complete! Router configured & systemd service installed (Auto-starts on boot). ==="
+        else
+            nohup "$SCRIPT_DIR/pc_watchdog.sh" > /dev/null 2>&1 &
+            echo ""
+            echo "=== Complete! Router configured & background watchdog started. ==="
+        fi
+        ;;
+    *)
+        echo ""
+        echo "=== Complete! Router configured. Watchdog disabled. ==="
+        ;;
+esac
