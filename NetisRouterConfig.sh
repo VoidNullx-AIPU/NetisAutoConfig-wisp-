@@ -89,6 +89,7 @@ rssh "
     iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
 "
 
+SCRIPT_DIR="$HOME/.local/bin"
 # 4. Generate local helper scripts & persistent systemd unit
 echo "[4/4] Generating local scripts & setting up autostart..."
 
