@@ -1,4 +1,12 @@
 ---
+# Netis / Realtek Router WISP CLI Auto-Configurator
+
+An automated Bash tool for configuring WISP (Wireless Internet Service Provider) / Station mode on Netis and Realtek-based routers via SSH. 
+
+This script automates setting network parameters, triggering site surveys, extracting target BSSIDs, removing wlan0 from bridge interfaces, acquiring DHCP leases, and setting up IPv4 NAT routing.
+
+---
+
 
 ## Update — Major Fixes & Watchdog Rework
 
@@ -24,13 +32,6 @@ tar -xzf openssh-9.9p2.tar.gz && cd openssh-9.9p2
 make && make install
 ```
 
-# Netis / Realtek Router WISP CLI Auto-Configurator
-
-An automated Bash tool for configuring WISP (Wireless Internet Service Provider) / Station mode on Netis and Realtek-based routers via SSH. 
-
-This script automates setting network parameters, triggering site surveys, extracting target BSSIDs, removing wlan0 from bridge interfaces, acquiring DHCP leases, and setting up IPv4 NAT routing.
-
----
 
 ## Features
 
