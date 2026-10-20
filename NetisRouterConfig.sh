@@ -242,7 +242,7 @@ FAIL_THRESHOLD=2            # consecutive failures before triggering reconnect
 RECONNECT_COOLDOWN=30       # min seconds between reconnect attempts
 RESTORE_POLL_INTERVAL=3     # seconds between recovery checks after reconnect
 RESTORE_MAX_TRIES=6         # max recovery polls before giving up this cycle
-HEARTBEAT_MIN=15            # "still OK" notification interval (0 = off)
+HEARTBEAT_MIN=0            # "still OK" notification interval (0 = off)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG="$SCRIPT_DIR/watchdog.log"
