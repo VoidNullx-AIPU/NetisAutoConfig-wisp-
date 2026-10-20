@@ -4,7 +4,7 @@
 
 A batch of fixes and quality-of-life improvements have landed since the initial release. If you're running an older copy, update your `NetisRouterConfig.sh`.
 
-### ⚠️ Breaking change: OpenSSH 10.x is not supported
+### Breaking change: OpenSSH 10.x is not supported
 
 **OpenSSH 10+ removed `diffie-hellman-group1-sha1` entirely** — it's not disabled-by-default, the implementation is *gone*. The router (Dropbear 0.48, 2008) only speaks that kex, so connections from OpenSSH 10 clients fail at `expecting SSH2_MSG_KEX_ECDH_REPLY` with `Connection reset by peer`.
 
